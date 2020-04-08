@@ -11,7 +11,7 @@ from PIL import Image
 IMG_FOLDER = './disney_img/'
 
 
-data = pd.read_csv('how_to_links.csv')
+data = pd.read_csv('how_to_not.csv')
 
 print('all records: ',data.shape[0])
 def save_img(url, name, folder='images'):
@@ -28,8 +28,8 @@ def save_img(url, name, folder='images'):
 images_saved = []
 for i, image in enumerate(data.to_dict(orient='records')):
     name = image['im_id']
-    if os.path.isfile(os.path.join(folder, name)):
-        images_saved.append(os.path.join(folder, name.replace('png','jpg')))
+    if os.path.isfile(os.path.join(IMG_FOLDER, name)):
+        images_saved.append(os.path.join(IMG_FOLDER, name.replace('png','jpg')))
         continue
     
     ## crop images and save as jpg
@@ -56,7 +56,7 @@ for i, image in enumerate(data.to_dict(orient='records')):
 max_len = 14
 min_len = 4
 
-disney=pd.read_csv('how_to_new.csv')
+disney=pd.read_csv('how_to_not.csv')
 disney['ext'] = disney['im_id'].apply(lambda r: r.split('.')[-1])
 disney = disney[disney['ext']=='jpg']
 
@@ -88,8 +88,8 @@ for item in tqdm(records):
             disney_words+=[w.lower() for w in caption.split(' ')]
             disney_captions.append(caption)
             disney_images.append(file_path)
-        except:
-            not_jpg.append(file_path)
+        except Exception as s:
+            print(e)
             
             
-pd.DataFrame(zip(disney_captions, disney_images), columns=['caption','path']).to_csv('clean_cpations_n_files.csv')
+pd.DataFrame(zip(disney_captions, disney_images), columns=['caption','path']).to_csv('clean_cpations_n_files_new.csv')

@@ -3,3 +3,6 @@
 **/train2014/
 **/checkpoint_dis
 **/old/
+**/__pycache__
+**/.ipynb_checkpoints
+*.zip

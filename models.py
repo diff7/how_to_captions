@@ -37,7 +37,6 @@ class BahdanauAttention(tf.keras.Model):
     
     
     
-
 ## feature extractor
     
 image_model = tf.keras.applications.InceptionV3(include_top=False,
@@ -74,10 +73,17 @@ class RNN_Decoder(tf.keras.Model):
         self.units = units
 
         self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
-        self.gru = tf.keras.layers.GRU(self.units,
+        
+        self.gru_one = tf.keras.layers.GRU(self.units,
                                        return_sequences=True,
                                        return_state=True,
                                        recurrent_initializer='glorot_uniform')
+        
+        self.gru_two = tf.keras.layers.GRU(self.units,
+                                       return_sequences=True,
+                                       return_state=True,
+                                       recurrent_initializer='glorot_uniform')
+        
         self.fc1 = tf.keras.layers.Dense(self.units, )
         self.fc2 = tf.keras.layers.Dense(vocab_size)
 
@@ -88,17 +94,26 @@ class RNN_Decoder(tf.keras.Model):
         # features = batch x 64 x 512
         # hidden shape = target.shape[0] == units
         # defining attention as a separate model
-        context_vector_one, attention_weights_one = self.attention_one(features_one, hidden)  
-        context_vector_two, attention_weights_two = self.attention_two(features_two, hidden)  
+        context_vector_one, _ = self.attention_one(features_one, hidden)  
 
         # x shape after passing through embedding == (batch_size, 1, embedding_dim)
-        x = self.embedding(x)
+        emb = self.embedding(x)
+        x = tf.keras.layers.Dropout(0.1)(emb)
+        
         # x shape after concatenation == (batch_size, 1, embedding_dim + hidden_size)
-        x = tf.concat([tf.expand_dims(context_vector_one, 1),tf.expand_dims(context_vector_two, 1), x], axis=-1)
+        
+        ### TODO split second attention to another gru
+        x = tf.concat([tf.expand_dims(context_vector_one, 1), x], axis=-1)
 
         # passing the concatenated vector to the GRU
-        output, state = self.gru(x)
+        output, state = self.gru_one(x)
+        
+        ### TODO add one more gru layer
+        context_vector_two, attention_weights = self.attention_two(features_two, state) 
+        x = tf.concat([tf.expand_dims(context_vector_two, 1), x], axis=-1)
+    
         # shape == (batch_size, max_length, hidden_size)
+        output, state = self.gru_two(x)
         x = self.fc1(output)
         
         # x shape == (batch_size * max_length, hidden_size)
@@ -107,7 +122,7 @@ class RNN_Decoder(tf.keras.Model):
         # output shape == (batch_size * max_length, vocab)
         x = self.fc2(x)
        
-        return x, state, attention_weights_one
+        return x, state, attention_weights
 
     def reset_state(self, batch_size):
         return tf.zeros((batch_size, self.units))

@@ -26,6 +26,7 @@ class Looper:
         self.params = {}
         self.params  = self.set_params()
         self.tokenizer = None
+        self.plot = []
 
 
     def set_params(self, params=None, verobese=True):
@@ -33,10 +34,9 @@ class Looper:
             self.params['VOCAB_SIZE'] = 5000
             self.params['BATCH_SIZE'] = 32
             self.params['BUFFER_SIZE'] = 5000       # for shuffle
-            self.params['embedding_dim'] = 512
+            self.params['embedding_img'] = 512
             self.params['embedding_words'] = 300
             self.params['units'] = 512     # gru units
-            self.params['embedding_size'] = self.params['VOCAB_SIZE'] + 1
             self.params['MAX_LENGTH'] = 20      # max len of tokens to train
             self.params['TOKENIZER_FOLDER'] = './tokenizer/'
             self.params['TOKENIZER_NAME'] = 'spbe_tokenizer.e'
@@ -44,11 +44,12 @@ class Looper:
 
         else:
             self.params.update(params)
+            self.params['embedding_size'] = self.params['VOCAB_SIZE'] + 1
 
-        self.encoder = self.encoder_class(self.params['embedding_dim'])
+        self.encoder = self.encoder_class(self.params['embedding_img'])
         self.decoder = self.decoder_class(self.params['embedding_words'],
                                     self.params['units'],
-                                    self.params['embedding_size'])
+                                    self.params['VOCAB_SIZE'] + 1)
 
         self.ckpt = tf.train.Checkpoint(encoder=self.encoder,
                            decoder = self.decoder,
@@ -96,7 +97,7 @@ class Looper:
         sbpe_tokenizer.train(files=text_file_name, vocab_size=self.params['VOCAB_SIZE']-2)
         sbpe_tokenizer.enable_padding(max_length=self.params['MAX_LENGTH'])
         sbpe_tokenizer.add_special_tokens(['<start>','<end>'])
-        sbpe_tokenizer.save(TOKENIZER_FOLDER,file_name)
+        sbpe_tokenizer.save(self.params['TOKENIZER_FOLDER'],file_name)
         return sbpe_tokenizer
 
     def make_dataset(self,
@@ -159,26 +160,35 @@ class Looper:
     @tf.function
     def train_step(self, image_array, encoded_captions):
         loss = 0
+        total_loss = 0
         # initializing the hidden state for each batch
         # because the captions are not related from image to image
         hidden = self.decoder.reset_state(batch_size=encoded_captions.shape[0])
-        dec_input = tf.expand_dims([self.tokenizer.token_to_id('<start>')] * encoded_captions.shape[0], 1)
+        next_input = tf.expand_dims([self.tokenizer.token_to_id('<start>')] * encoded_captions.shape[0], 1)
 
         with tf.GradientTape() as tape:
-            features_one, features_two = self.get_encoded_features(image_array)
+            features = self.get_encoded_features(image_array)
+            # NOTE get_encoded_features returns several feaures
+            self.decoder.pre_attention(features)
             for i in range(1, encoded_captions.shape[1]):
                 # passing the features through the decoder
-                predictions, hidden, _ = self.decoder(dec_input, features_one, features_two, hidden)
+                # features should iteratable list or tuple
+                predictions, hidden, _ = self.decoder(next_input, features, hidden)
                 loss += self.loss_function(encoded_captions[:, i], predictions)
-                # using teacher forcing
-                dec_input = tf.expand_dims(encoded_captions[:, i], 1)
+                total_loss+= loss
 
-        total_loss = (loss / int(encoded_captions.shape[1]))
+                # using teacher forcing
+                if False:
+                    next_input = tf.expand_dims(encoded_captions[:, i], 1)
+
+                if True:
+                    next_input =  tf.math.argmax(predictions, axis=1)
+                    next_input = tf.expand_dims(next_input, 1)
+
         trainable_variables = self.encoder.trainable_variables + self.decoder.trainable_variables
         gradients = tape.gradient(loss, trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, trainable_variables))
-        return loss, total_loss
-
+        return total_loss / (encoded_captions.shape[1]*encoded_captions.shape[0])
 
     def load_image(self, image_path):
         img = tf.io.read_file(image_path)
@@ -194,13 +204,15 @@ class Looper:
         img = tf.image.resize(img, (299, 299))
         img = tf.image.random_flip_left_right(img)
         img = tf.image.random_brightness(img, 10)
+        # if bool(np.random.randint(2)):
+        #     img = tf.image.adjust_saturation(img, 5*np.random.normal(scale=10))
         if bool(np.random.randint(2)):
             img = img +  tf.keras.backend.random_normal((299,299,3),0,np.random.randint(20))
         if bool(np.random.randint(2)):
             img = tf.image.random_contrast(img, 0, 2)
+        #img = tf.keras.preprocessing.image.random_rotation(img, 20)
         img = tf.keras.applications.inception_v3.preprocess_input(img)
         return img #, image_path
-
 
     def predict_one(self,
                     image_path,
@@ -211,7 +223,7 @@ class Looper:
         score = 0
         hidden = self.decoder.reset_state(batch_size=1)
         image_array = tf.expand_dims(self.load_image(image_path), 0)
-        features_one, features_two = self.get_encoded_features(image_array)
+        features = self.get_encoded_features(image_array)
 
         if (seed is not None) and (self.tokenizer.token_to_id(seed) is not None):
             print('seed :', seed)
@@ -221,8 +233,9 @@ class Looper:
             #print('seed is None')
             dec_input = tf.expand_dims([self.tokenizer.token_to_id('<start>')], 0)
 
+        self.decoder.pre_attention(features)
         for i in range(self.params['MAX_LENGTH']):
-            predictions, hidden, _ = self.decoder(dec_input, features_one, features_two, hidden)
+            predictions, hidden, _ = self.decoder(dec_input, features, hidden)
             ### Slighlty randomize prediction - can be changed to Beam Search ###
             # SET TO 2 - 4 IF ARGMAX POlICY REQUIRED #
             if i%argmax==0:
@@ -251,41 +264,58 @@ class Looper:
         return features_one, features_two
 
     @tf.function
-    def predict_step_batch(self, image_array, curr_batch_size, t=0.5, argmax=1, at_k=5):
+    def predict_step_batch(self,
+                           image_array,
+                           encoded_captions,
+                           curr_batch_size,
+                           t=0.5,
+                           argmax=1,
+                           at_k=5):
 
         # initiate variables
-        pred_ids_all = []
-        pred_ids = tf.convert_to_tensor([self.tokenizer.token_to_id('<start>')]*curr_batch_size)
-        pred_ids = tf.cast(pred_ids, tf.int64)
-        pred_ids_all.append(pred_ids)
-        dec_input = tf.expand_dims(pred_ids, 1)
+        total_loss = 0
+        preds_id_all = []
+        preds_id = tf.convert_to_tensor([self.tokenizer.token_to_id('<start>')]*curr_batch_size)
+        preds_id = tf.cast(preds_id, tf.int64)
+        preds_id_all.append(preds_id)
+        next_input = tf.expand_dims(preds_id, 1)
 
         hidden = self.decoder.reset_state(batch_size=curr_batch_size)
-        features_one, features_two = self.get_encoded_features(image_array)
-
+        features = self.get_encoded_features(image_array)
+        self.decoder.pre_attention(features)
         for i in range(1, at_k):
             # passing the features through the decoder
-            predictions, hidden, _ = self.decoder(dec_input, features_one, features_two, hidden)
+            #print('input',next_input.shape)
+            predictions, hidden, _ = self.decoder(next_input, features, hidden)
+            loss = self.loss_function(encoded_captions[:, i], predictions)
+            total_loss += loss
             if i%argmax==0:
-                pred_ids = tf.random.categorical(predictions/t, 1)[:,0] #.numpy()
+                preds_id = tf.random.categorical(predictions/t, 1)[:,0] #.numpy()
             else:
-                # TODO rewrite to TF not np
-                #print('arg')
-                pred_ids =  tf.math.argmax(predictions, axis=1)
+                #TODO: rewrite to TF not np
 
-            pred_ids_all.append(pred_ids)
+                preds_id =  tf.math.argmax(predictions, axis=1)
 
-            dec_input = tf.expand_dims(pred_ids, 1)
 
-        return tf.stack(pred_ids_all, axis=1)
+            preds_id_all.append(preds_id)
+            next_input = tf.expand_dims(preds_id, 1)
 
-    def precicion_atk_batch(self, dataset, at_k,t, argmax=2):
+        #loss = loss / int(encoded_captions.shape[0])
+        return tf.stack(preds_id_all, axis=1), total_loss / (at_k*encoded_captions.shape[0])
+
+    def precicion_atk_batch_n_loss(self, dataset, at_k,t, argmax=2):
         score = 0
+        total_loss = 0
         for i , (image_array, encoded_captions) in enumerate(dataset):
-            curr_batch_size = encoded_captions.shape[0]
-            pred_words = self.predict_step_batch(image_array, curr_batch_size, t=t, at_k=at_k, argmax=argmax)
+            curr_batch_size = int(encoded_captions.shape[0])
+            pred_words, loss = self.predict_step_batch(image_array,
+                                                       encoded_captions,
+                                                       curr_batch_size,
+                                                       t=t,
+                                                       at_k=at_k,
+                                                       argmax=argmax)
+            total_loss += loss
             mask = tf.cast(tf.ones(shape=(curr_batch_size, at_k)),tf.int64)
-
             # zero special token words & some frequen words
             for zero_token in ['<start>','<end>','▁how','▁to']:
                 mask *=tf.cast(tf.not_equal(pred_words,self.tokenizer.token_to_id(zero_token)),tf.int64)
@@ -293,31 +323,37 @@ class Looper:
             pred_words*=mask
             true = tf.cast(encoded_captions[:,:at_k], tf.int64)
             score += (tf.reduce_sum(tf.cast(pred_words == true, tf.int8)) / curr_batch_size)
-        return score.numpy()/(i+1)
-
+        return score.numpy()/(i+1), total_loss.numpy()/(i+1)
 
 
     def train(self, train, val, num_epochs, save_n=3):
         for epoch in range(0, num_epochs):
             start = time.time()
             total_loss = 0
-
             for (batch, (image_array, encoded_captions)) in enumerate(train):
-                batch_loss, t_loss = self.train_step(image_array, encoded_captions)
-                total_loss += t_loss
+                batch_loss = self.train_step(image_array, encoded_captions)
+                total_loss+= batch_loss
+
                 if batch % 100 == 0:
                     print ('Epoch {} Batch {} Loss {:.4f}'.format(
-                      epoch + 1, batch, batch_loss.numpy() / int(encoded_captions.shape[0])))
+                      epoch + 1, batch, batch_loss))
             # storing the epoch end loss value to plot later
 
             # TODO add tensorboard
 
             if epoch % save_n == 0:
-                train_score = self.precicion_atk_batch(train, at_k=6,t=0.5, argmax=2)
-                val_score = self.precicion_atk_batch(val, at_k=6,t=0.5, argmax=2)
-                print(f'precision at | val: {val_score}, train: {train_score}')
+                train_score, t_loss = self.precicion_atk_batch_n_loss(train, at_k=10,t=0.5, argmax=2)
+                val_score, v_loss = self.precicion_atk_batch_n_loss(val, at_k=10,t=0.5, argmax=2)
+                print(f'precision at | val: {val_score}, train: {train_score}, train loss: {t_loss}')
                 self.ckpt_manager.save()
+                self.plot.append({'epoch':epoch,
+                            'val':val_score,
+                            'train':train_score,
+                            'loss':total_loss,
+                            'train_loss':t_loss,
+                            'val_loss':v_loss})
 
             print ('Epoch {} Loss {:.6f}'.format(epoch + 1,
                                                  total_loss/(batch+1)))
             print ('Time taken for 1 epoch {} sec\n'.format(time.time() - start))
+        return self.plot
